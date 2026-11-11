@@ -1,0 +1,22 @@
+# Copy to .github/workflows/decisions.yml in a repository linked with `de init`.
+# Fails a pull request that breaks a settled decision.
+# Add a repository secret DECISIONENGINE_TOKEN (create one with `de invite` for a CI member).
+name: Decisions
+
+on:
+  pull_request:
+
+jobs:
+  decisions:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm install -g github:sighup/decisionengine
+      - run: de check --base origin/${{ github.base_ref }}
+        env:
+          DE_TOKEN: ${{ secrets.DECISIONENGINE_TOKEN }}

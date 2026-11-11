@@ -1,0 +1,27 @@
+# Self-hosted DecisionEngine: the service plus Postgres.
+#   docker compose up -d
+#   de setup http://localhost:4477 --workspace "Acme" --name "You" --email you@example.com
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: decisionengine
+      POSTGRES_PASSWORD: decisionengine
+      POSTGRES_DB: decisionengine
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U decisionengine"]
+      interval: 5s
+      retries: 10
+  server:
+    build: .
+    environment:
+      DATABASE_URL: postgres://decisionengine:decisionengine@db:5432/decisionengine
+    ports:
+      - "4477:4477"
+    depends_on:
+      db:
+        condition: service_healthy
+volumes:
+  pgdata:
