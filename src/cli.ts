@@ -95,6 +95,7 @@ program
     const { startServer } = await import("./server/main.js");
     const srv = await startServer({ port: Number(o.port), host: o.host, databaseUrl: o.databaseUrl, dataDir: o.dataDir });
     console.log(`DecisionEngine ${VERSION} listening on ${srv.url}  (${o.databaseUrl ? "Postgres" : "embedded Postgres"})`);
+    console.log(srv.capture ? "Automatic capture: on" : c.dim("Automatic capture: off (set ANTHROPIC_API_KEY to turn it on)"));
     const health = await new ApiClient(srv.url).health();
     if (health.setup_required) console.log(`\nFirst run. Create your workspace:\n  de setup ${srv.url} --workspace "Acme" --name "Your Name" --email you@example.com`);
     const shutdown = async () => {
@@ -185,6 +186,7 @@ program
   .option("--project <slug>", "project slug (default: from the git remote or directory name)")
   .option("--claude", "install Claude Code hooks and MCP config")
   .option("--git-hook", "install a git pre-commit check")
+  .option("--no-capture", "don't send Claude Code sessions for decision capture")
   .option("--bin <command>", "command used to invoke DecisionEngine from hooks", "de")
   .action(async (o) => {
     const s = session();
@@ -192,7 +194,7 @@ program
     const { project } = await s.api.upsertProject({ slug: o.project ?? defaultProjectSlug(root), repo_url: gitRemote(root) });
     writeLink(root, { server: s.ctx.server, project: project.slug });
     console.log(`Linked ${relative(process.cwd(), join(root, LINK_FILE)) || LINK_FILE} to project ${c.bold(project.slug)} on ${s.ctx.server}`);
-    if (o.claude) for (const line of installClaudeCode(root, o.bin)) console.log(`Installed ${line}`);
+    if (o.claude) for (const line of installClaudeCode(root, o.bin, { capture: o.capture })) console.log(`Installed ${line}`);
     if (o.gitHook) console.log(`Installed ${installGitHook(root, o.bin)}`);
     console.log(c.dim(`\nCommit ${LINK_FILE}${o.claude ? ", .claude/settings.json and .mcp.json" : ""} so teammates' agents use the same decisions.`));
   });
@@ -201,10 +203,11 @@ program
   .command("install")
   .description("wire DecisionEngine into an agent or workflow")
   .addArgument(new Command().createArgument("<target>", "claude-code | git-hook").choices(["claude-code", "git-hook"]))
+  .option("--no-capture", "don't send Claude Code sessions for decision capture")
   .option("--bin <command>", "command used to invoke DecisionEngine from hooks", "de")
   .action((target, o) => {
     const root = findProjectRoot();
-    if (target === "claude-code") for (const line of installClaudeCode(root, o.bin)) console.log(`Installed ${line}`);
+    if (target === "claude-code") for (const line of installClaudeCode(root, o.bin, { capture: o.capture })) console.log(`Installed ${line}`);
     else console.log(`Installed ${installGitHook(root, o.bin)}`);
   });
 
@@ -496,6 +499,81 @@ program
   });
 
 program
+  .command("capture")
+  .description("find decisions in commit history or notes and record them as proposals to review")
+  .option("--from-git", "read this repository's commit history")
+  .option("--since <date>", "with --from-git: only commits after this date (e.g. 2025-01-01, '6 months ago')")
+  .option("--limit <n>", "with --from-git: only the most recent n commits")
+  .option("--range <range>", "with --from-git: a revision range, e.g. v1.0..main")
+  .option("--notes <file>", "read notes, a thread or a document ('-' for stdin)")
+  .option("--ref <ref>", "where the material came from (a URL or name), kept on each proposal")
+  .option("--yes", "skip the confirmation prompt")
+  .action(async (o) => {
+    if (!o.fromGit === !o.notes) throw new UsageError("Pass exactly one of --from-git or --notes <file>.");
+    const s = session();
+    const status = await s.api.captureStatus();
+    if (!status.enabled) throw new UsageError(`Capture is not enabled on ${s.ctx.server}. The server needs ANTHROPIC_API_KEY set.`);
+    const { readCommits, batchCommits, renderCommits } = await import("./client/capture.js");
+    const { redactSecrets, chunkText } = await import("./core/capture.js");
+    const requests: { text: string; ref?: string; label: string }[] = [];
+    let source: "git" | "notes";
+    if (o.fromGit) {
+      source = "git";
+      const root = findProjectRoot();
+      if (!isGitRepo(root)) throw new UsageError("Not a git repository.");
+      let commits;
+      try {
+        commits = readCommits(root, { since: o.since, limit: o.limit ? Number(o.limit) : undefined, range: o.range });
+      } catch (e) {
+        throw new GitError(`git log failed: ${(e as Error).message.split("\n")[0]}`);
+      }
+      if (!commits.length) return console.log("No commits to read.");
+      // Modest batches keep extraction careful; each sees the proposals from the ones before it.
+      for (const b of batchCommits(commits, 120_000))
+        requests.push({ text: redactSecrets(renderCommits(b)), ref: o.ref ?? `git:${b[0].hash.slice(0, 10)}..${b[b.length - 1].hash.slice(0, 10)}`, label: `${b.length} commits (${b[0].date} to ${b[b.length - 1].date})` });
+      console.log(`Read ${commits.length} commits; ${requests.length} batch(es) to analyse.`);
+    } else {
+      source = "notes";
+      const text = o.notes === "-" ? readStdin() : readFileSync(o.notes, "utf8");
+      if (!text.trim()) return console.log("Nothing to read.");
+      const parts = chunkText(redactSecrets(text), 120_000);
+      parts.forEach((t, i) => requests.push({ text: t, ref: o.ref ?? (o.notes === "-" ? undefined : basename(o.notes)), label: parts.length > 1 ? `part ${i + 1}/${parts.length}` : "notes" }));
+    }
+    const chars = requests.reduce((n, r) => n + r.text.length, 0);
+    if (!o.yes && process.stdin.isTTY) {
+      const ok = await prompt(`Send ${chars.toLocaleString()} characters to ${s.ctx.server} for analysis? [y/N] `);
+      if (!/^y/i.test(ok)) return console.log("Cancelled.");
+    }
+    let total = 0;
+    for (const r of requests) {
+      process.stdout.write(c.dim(`Analysing ${r.label}… `));
+      const res = await s.api.capture({ source, text: r.text, source_ref: r.ref, project: s.ctx.project });
+      console.log(c.dim(`${res.proposals.length} proposal(s)`));
+      for (const { decision: d } of res.proposals) console.log(`  ${c.yellow(d.id)} ${d.title}`);
+      total += res.proposals.length;
+    }
+    console.log(total ? `\n${total} proposal(s) recorded. Review them in the dashboard (\`de ui\`) or with \`de list --status proposed\`, then \`de accept <id>\`.` : "\nNo settled decisions found.");
+  });
+
+program
+  .command("capture-session", { hidden: true })
+  .description("send the unsent part of a Claude Code session for capture (run by the Stop/SessionEnd hooks)")
+  .requiredOption("--transcript <path>")
+  .requiredOption("--session <id>")
+  .option("--final", "send whatever is new, however little")
+  .action(async (o) => {
+    // Runs detached from the agent; never surfaces errors to it.
+    try {
+      const s = Session.tryOpen();
+      if (!s?.ctx.linked) return;
+      const { captureSession } = await import("./client/capture.js");
+      await captureSession(s, { transcript: o.transcript, sessionId: o.session, final: !!o.final });
+    } catch {
+      // Unsent turns stay unsent and go with the next capture.
+    }
+  });
+
+program
   .command("export")
   .description("export every decision (you own your data)")
   .addOption(new Option("--format <format>").choices(["markdown", "json"]).default("markdown"))
@@ -540,7 +618,7 @@ program
 program
   .command("hook")
   .description("entry point for agent hooks (reads the hook payload on stdin)")
-  .addArgument(new Command().createArgument("<event>").choices(["pre-tool-use", "session-start"]))
+  .addArgument(new Command().createArgument("<event>").choices(["pre-tool-use", "session-start", "stop", "session-end"]))
   .action(async (event) => {
     // Fail open: a problem inside DecisionEngine must never block an agent. Only a real violation does.
     try {
@@ -554,6 +632,11 @@ program
       if (!s?.ctx.linked) return; // repository not linked to DecisionEngine
       if (event === "session-start") {
         process.stdout.write(await sessionStartContext(s));
+        return;
+      }
+      if (event === "stop" || event === "session-end") {
+        const { spawnSessionCapture } = await import("./client/capture.js");
+        spawnSessionCapture(input, event === "session-end");
         return;
       }
       const { exitCode, stderr } = await runPreToolUse(s, input);

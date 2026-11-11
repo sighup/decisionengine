@@ -1,5 +1,6 @@
 import type { CheckEvent, Decision, DecisionPatch, DecisionStats, Revision } from "../core/types.js";
 import type { LintIssue } from "../core/graph.js";
+import type { CaptureSource } from "../core/capture.js";
 
 export class ApiError extends Error {
   constructor(message: string, readonly status: number) {
@@ -87,6 +88,13 @@ export class ApiClient {
   }
   digest(days = 7) {
     return this.request<{ markdown: string }>("GET", `/v1/digest?days=${days}&format=json`);
+  }
+  captureStatus() {
+    return this.request<{ enabled: boolean; max_chars: number }>("GET", "/v1/capture");
+  }
+  /** Extraction can take a while (it reads the whole material), hence the long timeout. */
+  capture(b: { source: CaptureSource; text: string; source_ref?: string; project?: string }, timeoutMs = 10 * 60_000) {
+    return this.request<{ proposals: { decision: Decision; warnings: string[] }[] }>("POST", "/v1/capture", b, timeoutMs);
   }
   reportChecks(checks: CheckEvent[], timeoutMs?: number) {
     return this.request<{ recorded: number }>("POST", "/v1/checks", { checks }, timeoutMs);

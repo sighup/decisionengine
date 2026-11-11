@@ -5,6 +5,8 @@ import { digestMarkdown } from "../core/render.js";
 import { ValidationError } from "../core/validate.js";
 import { PAGE } from "../ui/page.js";
 import { VERSION } from "../version.js";
+import { CAPTURE_SOURCES, MAX_CAPTURE_CHARS } from "../core/capture.js";
+import type { Extractor } from "./extract.js";
 import type { Hub } from "./hub.js";
 import { ConflictError, ForbiddenError, NotFoundError, type Member, type Repo, type Workspace } from "./repo.js";
 
@@ -15,7 +17,7 @@ const days = (c: Context, def = 7) => {
   return new Date(Date.now() - (Number.isFinite(n) && n > 0 ? n : def) * 864e5);
 };
 
-export function createApp(repo: Repo, hub: Hub, opts: { heartbeatMs?: number } = {}) {
+export function createApp(repo: Repo, hub: Hub, opts: { heartbeatMs?: number; extractor?: Extractor } = {}) {
   const app = new Hono<Env>();
 
   app.onError((err, c) => {
@@ -80,6 +82,25 @@ export function createApp(repo: Repo, hub: Hub, opts: { heartbeatMs?: number } =
   });
   app.patch("/v1/decisions/:key", async (c) => c.json({ decision: await repo.updateDecision(c.get("member"), c.req.param("key"), await c.req.json()) }));
   app.get("/v1/decisions/:key/revisions", async (c) => c.json({ revisions: await repo.revisions(c.get("workspace").id, c.req.param("key")) }));
+
+  // Capture: turn a session transcript, commit history or notes into *proposed* decisions.
+  app.get("/v1/capture", (c) => c.json({ enabled: !!opts.extractor, max_chars: MAX_CAPTURE_CHARS }));
+  app.post("/v1/capture", async (c) => {
+    if (!opts.extractor) return c.json({ error: "capture is not enabled on this server (set ANTHROPIC_API_KEY)" }, 501);
+    const b = await c.req.json();
+    if (!CAPTURE_SOURCES.includes(b?.source)) throw new ValidationError(`source must be one of ${CAPTURE_SOURCES.join(", ")}`);
+    if (typeof b.text !== "string" || !b.text.trim()) throw new ValidationError("text is required");
+    if (b.text.length > MAX_CAPTURE_CHARS) return c.json({ error: `text exceeds ${MAX_CAPTURE_CHARS} characters; split it` }, 413);
+    const ws = c.get("workspace").id;
+    const { decisions: existing } = await repo.listDecisions(ws);
+    const proposals = await opts.extractor.extract({ source: b.source, text: b.text, existing });
+    const created = await repo.createProposals(c.get("member"), proposals, {
+      source: b.source,
+      source_ref: typeof b.source_ref === "string" ? b.source_ref : undefined,
+      project: typeof b.project === "string" && b.project ? b.project : undefined,
+    });
+    return c.json({ proposals: created }, 201);
+  });
 
   app.get("/v1/lint", async (c) => {
     const { decisions } = await repo.listDecisions(c.get("workspace").id);

@@ -9,6 +9,7 @@ import { writeLink } from "../src/client/config.js";
 import type { Decision } from "../src/core/types.js";
 import { createApp } from "../src/server/app.js";
 import { migrate, openPglite, openPostgres, type Db } from "../src/server/db.js";
+import type { Extractor } from "../src/server/extract.js";
 import { Hub } from "../src/server/hub.js";
 import { Repo } from "../src/server/repo.js";
 
@@ -27,13 +28,13 @@ async function testDb(): Promise<Db> {
   return openPostgres(url.toString());
 }
 
-export async function startTestServer() {
+export async function startTestServer(opts: { extractor?: Extractor } = {}) {
   const db = await testDb();
   await migrate(db);
   const repo = new Repo(db);
   const hub = new Hub(db);
   await hub.start();
-  const app = createApp(repo, hub, { heartbeatMs: 200 });
+  const app = createApp(repo, hub, { heartbeatMs: 200, extractor: opts.extractor });
   const server = await new Promise<ReturnType<typeof serve>>((resolve) => {
     const s = serve({ fetch: app.fetch, port: 0, hostname: "127.0.0.1" }, () => resolve(s));
   });

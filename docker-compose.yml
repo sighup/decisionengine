@@ -18,6 +18,8 @@ services:
     build: .
     environment:
       DATABASE_URL: postgres://decisionengine:decisionengine@db:5432/decisionengine
+      # Turns on automatic decision capture; leave unset to disable it.
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
     ports:
       - "4477:4477"
     depends_on:

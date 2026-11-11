@@ -4,9 +4,9 @@ A service plus CLI for capturing team decisions and enforcing them on coding age
 
 ## Layout
 
-- `src/core/` pure domain logic shared by client and server: types, validation, graph, rule evaluation, check, rendering, markdown export
-- `src/server/` the service: `db.ts` (pg + PGlite behind one interface), `schema.ts` (append-only migrations), `repo.ts` (data access + business rules), `hub.ts` (LISTEN/NOTIFY fan-out), `app.ts` (Hono routes + SSE), `main.ts`
-- `src/client/` developer-machine side: `config.ts` (credentials, project link), `api.ts` (HTTP client), `cache.ts` (synced snapshot, telemetry outbox, SSE watcher), `session.ts`
+- `src/core/` pure domain logic shared by client and server: types, validation, graph, rule evaluation, check, rendering, markdown export, capture limits and redaction
+- `src/server/` the service: `db.ts` (pg + PGlite behind one interface), `schema.ts` (append-only migrations), `repo.ts` (data access + business rules), `hub.ts` (LISTEN/NOTIFY fan-out), `extract.ts` (Claude extraction for capture), `app.ts` (Hono routes + SSE), `main.ts`
+- `src/client/` developer-machine side: `config.ts` (credentials, project link), `api.ts` (HTTP client), `cache.ts` (synced snapshot, telemetry outbox, SSE watcher), `session.ts`, `capture.ts` (transcript and git history capture)
 - `src/agent/` Claude Code hooks and installers (`hooks.ts`), MCP server (`mcp.ts`)
 - `src/ui/page.ts` the dashboard: one self-contained page, no build step, no external requests
 - `src/cli.ts` commander entry point
@@ -17,6 +17,7 @@ A service plus CLI for capturing team decisions and enforcing them on coding age
 - Enforcement stays deterministic and runs client-side against the snapshot. No LLM calls in `src/core/rules.ts`, `check.ts` or the hook path.
 - Hooks fail open on internal errors; only a real violation blocks (exit 2).
 - Never edit a shipped migration in `schema.ts`; append a new one.
+- The LLM is for capture only (`src/server/extract.ts`). Captured decisions are always `proposed`; only a person's accept makes them enforceable or applies their supersession.
 - Every decision write goes through `Repo` so it gets a revision row and an `events` row with `pg_notify`.
 
 ## Commands

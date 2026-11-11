@@ -54,7 +54,7 @@ de init --claude --git-hook
 de invite --name "Dana" --email dana@example.com
 ```
 
-`de init` writes `.decisionengine.json` (just the server URL and project name, no decisions) and, with `--claude`, adds hooks to `.claude/settings.json` and the MCP server to `.mcp.json`. Commit those files so every teammate's agent is connected.
+`de init` writes `.decisionengine.json` (just the server URL and project name, no decisions) and, with `--claude`, adds hooks to `.claude/settings.json` (enforcement, context and capture) and the MCP server to `.mcp.json`. Commit those files so every teammate's agent is connected.
 
 ## How agents use it
 
@@ -65,6 +65,7 @@ de invite --name "Dana" --email dana@example.com
 | Every `Write` / `Edit` / `MultiEdit` | A `PreToolUse` hook checks only the lines being added. A violation blocks the edit and tells the agent why. |
 | Every `npm i` / `pip install` / `cargo add` / `go get` | The same hook catches forbidden dependencies before they are installed. |
 | The user settles a choice | The agent records it with `record_decision`, including rejected options. Every teammate's agent has it within seconds. |
+| The agent replies or the session ends | `Stop` and `SessionEnd` hooks send the new part of the conversation for capture, in the background. Anything settled but not recorded becomes a proposal to review. |
 | A teammate decides something | The MCP server's live feed updates the local snapshot, so the next hook already enforces it. |
 | Commit / pull request | `de check --staged` (pre-commit) and `de check --base origin/main` (CI) are the final gate. |
 
@@ -79,6 +80,18 @@ Any MCP client (Cursor, Windsurf, Codex, Claude Desktop) can use `de mcp` over s
 | `check_change` | Check proposed file contents before writing them |
 | `check_working_tree` | Check uncommitted changes, or a branch against its base |
 | `decision_digest` | What the team decided, reversed and enforced recently |
+
+## Automatic capture
+
+Most decisions are settled in conversation and never written down. DecisionEngine finds them for you:
+
+- **From agent sessions.** With `de init --claude`, Claude Code sessions are sent to the service in the background as they go (after every few turns, and at the end). Claude reads the conversation and pulls out the choices that were actually settled, with the reasoning and the options turned down.
+- **From history.** `de capture --from-git` reads the repository's commit history to reconstruct decisions made before you started; `--since`, `--limit` and `--range` narrow it.
+- **From notes.** `de capture --notes meeting.md` (or `-` for stdin) does the same for meeting notes, Slack exports, RFCs and design docs.
+
+Every captured decision arrives as **proposed**, linked to where it came from with a quote as evidence. Nothing is enforced and nothing is superseded until someone accepts it in the dashboard's review inbox (or with `de accept`). Duplicates of existing decisions, and proposals someone already rejected, are skipped.
+
+Capture runs on the service and needs `ANTHROPIC_API_KEY` set there (`DE_CAPTURE_MODEL` and `DE_CAPTURE_EFFORT` tune it; `DE_CAPTURE=off` disables it). Only what the developer and agent said is sent, not tool output or file contents, and common credential formats are redacted on the developer's machine first. To turn session capture off for a repository, run `de install claude-code --no-capture`; for one developer, set `DE_CAPTURE=off`. Enforcement never uses the model.
 
 ### Speed and failure modes
 
@@ -117,6 +130,7 @@ de lint                               broken links, cycles, stale dependencies, 
 de digest [--days 7]                  decided, reversed, enforced: the standup you can skip
 de watch                              follow the team's decisions live
 de ui                                 open the dashboard, signed in
+de capture --from-git | --notes <file>   find decisions in history or notes, as proposals
 de import-adr <dir>                   import existing ADRs (Nygard or MADR)
 de export [--format markdown|json]    everything, any time
 de mcp  ·  de hook <event>            agent entry points
@@ -126,7 +140,7 @@ de mcp  ·  de hook <event>            agent entry points
 
 ## Dashboard
 
-The service serves a dashboard at its root URL (`de ui` opens it signed in). It shows the decision log with rationale, rejected options and history; the dependency graph; enforcement activity across the team; and graph health. It updates live as teammates and their agents record decisions or trip rules, and lets you accept or retire proposed decisions.
+The service serves a dashboard at its root URL (`de ui` opens it signed in). It shows the decision log with rationale, rejected options and history; the dependency graph; enforcement activity across the team; and graph health. It updates live as teammates and their agents record decisions or trip rules. Captured proposals wait in a review inbox, each with its evidence and source, to be accepted or rejected.
 
 ## Deploying
 
@@ -136,7 +150,7 @@ The service is one Node process plus Postgres.
 docker compose up -d     # service on :4477 with Postgres 16
 ```
 
-Or run `de server` anywhere with `DATABASE_URL` set (Postgres 14+). Migrations run automatically on start. Multiple instances can run behind a load balancer: real-time fan-out goes through Postgres `LISTEN/NOTIFY`. Put TLS in front of it (any reverse proxy). Without `DATABASE_URL`, `de server` uses embedded Postgres in `~/.local/share/decisionengine`, which suits a single machine or a trial.
+Set `ANTHROPIC_API_KEY` on the service to turn on automatic capture. Or run `de server` anywhere with `DATABASE_URL` set (Postgres 14+). Migrations run automatically on start. Multiple instances can run behind a load balancer: real-time fan-out goes through Postgres `LISTEN/NOTIFY`. Put TLS in front of it (any reverse proxy). Without `DATABASE_URL`, `de server` uses embedded Postgres in `~/.local/share/decisionengine`, which suits a single machine or a trial.
 
 ## CI
 
@@ -149,8 +163,7 @@ See [`docs/architecture.md`](docs/architecture.md) for the data model, the real-
 ## Roadmap
 
 - Sign-in with GitHub/Google and SSO in place of pasted tokens
-- Capture from Slack threads, docs and meeting notes
-- Reconstructing past decisions from commit and PR history
+- Capture straight from Slack, pull request discussions and docs (today: paste or export them into `de capture --notes`)
 - Conflict detection between in-flight branches and between teammates' pending work
 - More rule types (AST-aware imports, API surface, file ownership)
 - Hosted offering

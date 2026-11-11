@@ -97,7 +97,10 @@ svg .id { fill: var(--muted); font: 11px var(--mono); }
 button { font: inherit; padding: 6px 12px; border-radius: 6px; border: 1px solid var(--accent); background: var(--accent); color: var(--panel); cursor: pointer; }
 button.ghost { background: transparent; color: var(--ink); border-color: var(--line); }
 button:disabled { opacity: .5; }
-.actions { display: flex; gap: 8px; margin: 8px 0 4px; }
+.actions { display: flex; gap: 8px; margin: 8px 0 4px; flex-wrap: wrap; }
+.inbox { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; padding: 9px 12px; margin-bottom: 10px; border-radius: 8px; background: var(--info-soft); color: var(--info); }
+.inbox button { flex: none; }
+.captured { padding: 8px 10px; border-left: 3px solid var(--info); background: var(--info-soft); border-radius: 4px; margin: 8px 0; }
 .hist { list-style: none; padding: 0; margin: 0; font-size: 13px; }
 .hist li { padding: 3px 0; }
 .toast { position: fixed; right: 16px; bottom: 16px; max-width: min(420px, calc(100vw - 32px)); background: var(--ink); color: var(--panel); padding: 10px 14px; border-radius: 8px; box-shadow: 0 6px 24px rgba(0,0,0,.2); font-size: 13px; z-index: 10; }
@@ -189,6 +192,9 @@ function renderKpis() {
   $("#so").onclick = (e) => { e.preventDefault(); signOut(); };
 }
 
+const CAPTURE_LABEL = { "capture:claude-code": "a Claude Code session", "capture:git": "commit history", "capture:notes": "notes" };
+const captured = (d) => typeof d.source === "string" && d.source.startsWith("capture:");
+
 function itemHtml(d) {
   const st = S.state.stats[d.id];
   return '<div class="item ' + d.status + (S.sel === d.id ? " sel" : "") + '" data-id="' + d.id + '">' +
@@ -196,6 +202,7 @@ function itemHtml(d) {
     '<div class="t">' + esc(d.title) + "</div>" +
     '<div class="badges"><span class="b ' + d.status + '">' + d.status + "</span>" +
     (d.rules.length && d.status === "accepted" ? '<span class="b enf">enforced</span>' : "") +
+    (d.status === "proposed" && captured(d) ? '<span class="b">captured</span>' : "") +
     (st && st.violations ? '<span class="b bad">' + st.violations + " caught</span>" : "") +
     (d.downstreamAll ? '<span class="b">' + d.downstreamAll + " depend on it</span>" : "") +
     d.tags.slice(0, 3).map((t) => '<span class="b">' + esc(t) + "</span>").join("") +
@@ -215,7 +222,11 @@ function detailHtml(id) {
   const down = d.downstream.map((x) => all[x]).filter(Boolean);
   const meta = [d.id, d.status, d.date, d.author && "by " + d.author, d.discipline, "rev " + d.revision].filter(Boolean).map(esc).join(" · ");
   let h = '<div class="meta mono">' + meta + "</div><h1>" + esc(d.title) + "</h1>";
-  if (d.status === "proposed") h += '<div class="actions"><button data-act="accepted">Accept</button><button data-act="deprecated" class="ghost">Reject</button></div>';
+  if (d.status === "proposed") {
+    if (captured(d)) h += '<div class="captured">Found in ' + esc(CAPTURE_LABEL[d.source] || d.source.slice(8)) + ". Nothing is enforced until someone accepts it." + (d.rules.length ? " Accepting turns on the rules below." : "") + "</div>";
+    if (d.supersedes.length) h += '<div class="meta">Accepting replaces ' + d.supersedes.map(esc).join(", ") + ".</div>";
+    h += '<div class="actions"><button data-act="accepted">Accept</button><button data-act="deprecated" class="ghost">Reject</button></div>';
+  }
   else if (d.status === "accepted") h += '<div class="actions"><button data-act="deprecated" class="ghost">Deprecate</button></div>';
   if (d.superseded_by) h += "<p>Replaced by " + linkHtml(all[d.superseded_by] || { id: d.superseded_by, title: "(missing)", status: "" }) + "</p>";
   if (d.status === "accepted") {
@@ -231,12 +242,18 @@ function detailHtml(id) {
       "<div><h3>Depended on by" + (d.downstreamAll > down.length ? " (" + d.downstreamAll + " total)" : "") + "</h3>" + (down.map(linkHtml).join("") || '<div class="meta">Nothing yet</div>') + "</div></div>";
     if (d.supersedes.length) h += "<h3>Replaces</h3>" + d.supersedes.map((x) => all[x]).filter(Boolean).map(linkHtml).join("");
   }
-  if (d.body) h += '<h3>Notes</h3><div class="body">' + esc(d.body) + "</div>";
-  if (d.source_ref) h += '<h3>Decided in</h3><div class="mono">' + esc(d.source_ref) + "</div>";
+  if (d.body) h += "<h3>" + (captured(d) ? "Evidence" : "Notes") + '</h3><div class="body">' + esc(captured(d) ? d.body.replace(/^> ?/gm, "") : d.body) + "</div>";
+  if (d.source_ref) h += "<h3>" + (captured(d) ? "Source" : "Decided in") + '</h3><div class="mono">' + esc(d.source_ref) + "</div>";
   const hist = S.history[d.id + ":" + d.revision];
   h += "<h3>History</h3>" + (hist ? '<ul class="hist">' + hist.map((r) => "<li><span class=\"mono\">r" + r.revision + "</span> " + esc(new Date(r.created_at).toLocaleString()) + " · " + esc(r.author || "") + (r.note ? " · " + esc(r.note) : "") + "</li>").join("") + "</ul>" : '<div class="meta">Loading…</div>');
   if (!hist) api("GET", "/v1/decisions/" + d.id + "/revisions").then((r) => { S.history[d.id + ":" + d.revision] = r.revisions; if (S.sel === d.id && S.tab === "log") $("#detail").innerHTML = detailHtml(d.id); }).catch(() => {});
   return h;
+}
+
+function inboxHtml() {
+  const n = visible().filter((d) => d.status === "proposed").length;
+  if (!n || S.status === "proposed") return "";
+  return '<div class="inbox"><span>' + n + " proposed decision" + (n === 1 ? "" : "s") + ' waiting for review</span><button class="ghost" id="review">Review</button></div>';
 }
 
 function renderLog() {
@@ -247,12 +264,13 @@ function renderLog() {
     '<input type="search" id="q" placeholder="Search decisions, reasons, rejected options" value="' + esc(S.q) + '">' +
     '<select id="st">' + ["active", "accepted", "proposed", "superseded", "deprecated", "all"].map((s) => "<option" + (S.status === s ? " selected" : "") + ">" + s + "</option>").join("") + "</select>" +
     (projects.length ? '<select id="pj"><option value="">all projects</option>' + projects.map((p) => '<option value="' + esc(p.slug) + '"' + (S.project === p.slug ? " selected" : "") + ">" + esc(p.slug) + "</option>").join("") + "</select>" : "") +
-    "</div>" +
+    "</div>" + inboxHtml() +
     '<div class="list">' + (list.map(itemHtml).join("") || '<div class="empty">No decisions match. Record one with <code>de new</code>, or let your agent record it.</div>') + "</div></div>" +
     '<div class="panel detail" id="detail">' + detailHtml(S.sel) + "</div></div>";
   const q = $("#q");
   q.oninput = () => { S.q = q.value; const pos = q.selectionStart; renderLog(); const n = $("#q"); n.focus(); n.setSelectionRange(pos, pos); };
   $("#st").onchange = (e) => { S.status = e.target.value; renderLog(); };
+  if ($("#review")) $("#review").onclick = () => { S.status = "proposed"; S.sel = null; renderLog(); };
   if ($("#pj")) $("#pj").onchange = (e) => { S.project = e.target.value; render(); };
 }
 
@@ -390,7 +408,7 @@ async function stream() {
           if (ev === "ping" || ev === "ready") continue;
           try {
             const e = JSON.parse(data);
-            if (ev === "decision.created") toast((e.actor || "Someone") + " recorded " + e.decision_key + ": " + (e.payload && e.payload.title || ""));
+            if (ev === "decision.created") toast((e.payload && e.payload.status === "proposed" ? "New proposal " : (e.actor || "Someone") + " recorded ") + e.decision_key + ": " + (e.payload && e.payload.title || ""));
             else if (ev === "check.violation" && e.payload && e.payload.blocked) toast("Blocked a change that broke " + e.payload.violations.map((v) => v.id).join(", "));
           } catch (x) {}
           load().catch(() => {});

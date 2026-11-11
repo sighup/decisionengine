@@ -109,6 +109,12 @@ describe("Claude Code hooks", () => {
     const settings = JSON.parse(readFileSync(join(root, ".claude/settings.json"), "utf8"));
     expect(settings.hooks.PreToolUse).toHaveLength(1);
     expect(settings.hooks.SessionStart).toHaveLength(1);
+    expect(settings.hooks.Stop[0].hooks[0].command).toBe("de hook stop");
+    expect(settings.hooks.SessionEnd[0].hooks[0].command).toBe("de hook session-end");
+    installClaudeCode(root, "de", { capture: false });
+    const without = JSON.parse(readFileSync(join(root, ".claude/settings.json"), "utf8"));
+    expect(without.hooks.Stop).toBeUndefined();
+    expect(without.hooks.PreToolUse).toHaveLength(1);
     expect(JSON.parse(readFileSync(join(root, ".mcp.json"), "utf8")).mcpServers.decisionengine).toEqual({ command: "de", args: ["mcp"] });
   });
 });

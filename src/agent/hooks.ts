@@ -148,14 +148,33 @@ function upsertHook(settings: any, event: string, matcher: string | undefined, c
   settings.hooks[event].push(entry);
 }
 
-export function installClaudeCode(root: string, bin = "de"): string[] {
+const OUR_HOOK = /\bde(cisionengine)?\b.*\bhook\b/;
+
+function removeHook(settings: any, event: string) {
+  const list: any[] | undefined = settings.hooks?.[event];
+  if (!list) return;
+  for (const g of list) g.hooks = (g.hooks ?? []).filter((h: any) => !(typeof h.command === "string" && OUR_HOOK.test(h.command)));
+  settings.hooks[event] = list.filter((g) => g.hooks.length);
+  if (!settings.hooks[event].length) delete settings.hooks[event];
+}
+
+export function installClaudeCode(root: string, bin = "de", opts: { capture?: boolean } = {}): string[] {
+  const capture = opts.capture ?? true;
   const done: string[] = [];
   const settingsPath = join(root, ".claude", "settings.json");
   const settings = readJson(settingsPath);
   upsertHook(settings, "PreToolUse", "Write|Edit|MultiEdit|Bash", `${bin} hook pre-tool-use`);
   upsertHook(settings, "SessionStart", undefined, `${bin} hook session-start`);
+  if (capture) {
+    // Both return immediately; capture runs in a background process.
+    upsertHook(settings, "Stop", undefined, `${bin} hook stop`);
+    upsertHook(settings, "SessionEnd", undefined, `${bin} hook session-end`);
+  } else {
+    removeHook(settings, "Stop");
+    removeHook(settings, "SessionEnd");
+  }
   writeJson(settingsPath, settings);
-  done.push(`${relative(root, settingsPath)}: PreToolUse enforcement + SessionStart context hooks`);
+  done.push(`${relative(root, settingsPath)}: PreToolUse enforcement + SessionStart context${capture ? " + Stop/SessionEnd decision capture" : ""} hooks`);
 
   const mcpPath = join(root, ".mcp.json");
   const mcp = readJson(mcpPath);

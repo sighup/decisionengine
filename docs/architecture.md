@@ -27,6 +27,8 @@ DecisionEngine has three parts: a **service** that is the source of truth, **cli
 
 **Fail open.** If the service is unreachable, hooks enforce the last snapshot and queue telemetry for later. If DecisionEngine itself errors, the agent is never blocked. Only a real violation blocks. CI (`de check`) is the exception: it requires a fresh copy from the service, because it is the final gate.
 
+**An LLM captures; people decide; rules enforce.** Most decisions are settled in conversation, so asking people to also write them down loses most of them. Capture reads agent sessions, commit history and notes, and Claude extracts what was actually settled (choice, reasoning, rejected options, a narrow rule when one is obvious). Everything it finds is recorded as `proposed`: never enforced, never superseding anything, until a person accepts it. This keeps the model's judgement out of enforcement entirely. Extraction runs on the service, so API keys live in one place and the model always sees the team's current decisions (to skip duplicates, link dependencies and propose supersessions). Rejected: extracting on each developer's machine (keys everywhere, inconsistent prompts) and auto-accepting high-confidence proposals (one bad rule would block every agent on the team).
+
 **Only added lines are checked.** Existing code never blocks new work; a decision governs what happens after it was made.
 
 ## Data model
@@ -40,6 +42,15 @@ DecisionEngine has three parts: a **service** that is the source of truth, **cli
 | `decision_revisions` | Immutable snapshot per revision, with author and note. |
 | `events` | Ordered change feed (`decision.created`, `decision.updated`, `decision.superseded`, `check.violation`). |
 | `checks` | Enforcement telemetry: who checked what, which decisions applied, what was blocked. |
+
+## Capture path
+
+1. Claude Code's `Stop` hook (after each agent reply) and `SessionEnd` hook run `de hook stop|session-end`, which spawns a detached `de capture-session` and returns in milliseconds.
+2. That process reads the session transcript, keeps only what the developer and agent said (no tool output, thinking or injected context), and waits until at least six new turns have built up (any amount at session end). It redacts credentials, prepends a few earlier turns for context, and posts the new part to `POST /v1/capture`. A per-session offset and lock in the cache directory mean each turn is sent once.
+3. The service passes the text and the workspace's current decisions to the extractor (Claude, structured output), validates what comes back, drops duplicates (including proposals someone already rejected) and records each remaining one as a `proposed` decision with `source = capture:<source>`, a `source_ref` back to the session, commits or document, the evidence quote, and the capturing project.
+4. Proposals reach the dashboard's review inbox over the normal change feed. Accepting one makes it enforceable and applies any supersession in the same transaction.
+
+`de capture --from-git` and `de capture --notes` use the same endpoint for commit history (oldest first, in batches, so later batches see earlier proposals) and documents.
 
 ## Real-time path
 

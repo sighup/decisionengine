@@ -242,10 +242,9 @@ export class Repo {
       const depends = (input.depends_on ?? []).map(fix);
       const supersedes = (input.supersedes ?? []).map(fix);
       for (const k of [...depends, ...supersedes]) if (!byKey.has(k)) throw new ValidationError(`no decision ${k}`);
-      for (const k of supersedes) {
-        const old = byKey.get(k)!;
-        if (old.status === "superseded") throw new ConflictError(`${k} is already superseded by ${old.superseded_by}`);
-      }
+      const status = input.status ?? "accepted";
+      // A proposal only names what it would replace; supersession happens when it is accepted.
+      if (status === "accepted") this.assertSupersedable(byKey, supersedes);
 
       const [{ next_number: n }] = await tx.query(`UPDATE workspaces SET next_number = next_number + 1 WHERE id = $1 RETURNING next_number - 1 AS next_number`, [ws.id]);
       const key = formatKey(ws.key_prefix, n);
@@ -253,7 +252,7 @@ export class Repo {
         `INSERT INTO decisions (id, workspace_id, key, number, title, status, decided_on, author_id, discipline, tags, scope, projects, why, rejected, depends_on, supersedes, rules, body, source, source_ref)
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)`,
         [
-          randomUUID(), ws.id, key, n, input.title, input.status ?? "accepted", input.date ?? new Date().toISOString().slice(0, 10), actor.id,
+          randomUUID(), ws.id, key, n, input.title, status, input.date ?? new Date().toISOString().slice(0, 10), actor.id,
           input.discipline ?? null, json(input.tags), json(input.scope), json(input.projects), input.why ?? null, json(input.rejected),
           json(depends), json(supersedes), json(input.rules), input.body ?? "", input.source ?? null, input.source_ref ?? null,
         ],
@@ -261,26 +260,73 @@ export class Repo {
       const decision = await this.writeRevision(tx, ws.id, key, actor.id, "recorded");
       await this.emit(tx, ws.id, "decision.created", key, actor.id, { title: decision.title, status: decision.status });
 
-      for (const k of supersedes) {
-        await tx.query(
-          `UPDATE decisions SET status = 'superseded', superseded_by = $3, revision = revision + 1, updated_at = now() WHERE workspace_id = $1 AND key = $2`,
-          [ws.id, k, key],
-        );
-        await this.writeRevision(tx, ws.id, k, actor.id, `superseded by ${key}`);
-        await this.emit(tx, ws.id, "decision.superseded", k, actor.id, { by: key });
-      }
+      const applied = status === "accepted" ? supersedes : [];
+      await this.applySupersession(tx, ws.id, key, applied, actor.id);
 
       const after = new DecisionGraph([
-        ...existing.map((d) => (supersedes.includes(d.id) ? { ...d, status: "superseded" as const, superseded_by: key } : d)),
+        ...existing.map((d) => (applied.includes(d.id) ? { ...d, status: "superseded" as const, superseded_by: key } : d)),
         decision,
       ]);
-      const warnings = after.lint().filter((i) => i.id === key && i.level !== "info").map((i) => i.message);
-      for (const k of supersedes) {
+      const warnings = after.lint().filter((i) => i.id === key && i.level !== "info" && !(status !== "accepted" && i.message.startsWith("supersedes"))).map((i) => i.message);
+      for (const k of applied) {
         const affected = new DecisionGraph(existing).downstream(k).map((d) => d.id);
         if (affected.length) warnings.push(`${affected.join(", ")} built on ${k}; re-examine them`);
       }
+      if (status !== "accepted" && supersedes.length) warnings.push(`will supersede ${supersedes.join(", ")} when accepted`);
       return { decision, warnings };
     });
+  }
+
+  private assertSupersedable(byKey: Map<string, Decision>, keys: string[]) {
+    for (const k of keys) {
+      const old = byKey.get(k);
+      if (!old) throw new ValidationError(`no decision ${k}`);
+      if (old.status === "superseded") throw new ConflictError(`${k} is already superseded by ${old.superseded_by}`);
+    }
+  }
+
+  private async applySupersession(tx: Queryable, workspaceId: string, by: string, keys: string[], actorId: string) {
+    for (const k of keys) {
+      await tx.query(
+        `UPDATE decisions SET status = 'superseded', superseded_by = $3, revision = revision + 1, updated_at = now() WHERE workspace_id = $1 AND key = $2`,
+        [workspaceId, k, by],
+      );
+      await this.writeRevision(tx, workspaceId, k, actorId, `superseded by ${by}`);
+      await this.emit(tx, workspaceId, "decision.superseded", k, actorId, { by });
+    }
+  }
+
+  /**
+   * Record extracted proposals. Each becomes a `proposed` decision (never
+   * enforced until someone accepts it), tagged with where it came from and
+   * scoped to the project it was captured in.
+   */
+  async createProposals(
+    actor: Member,
+    proposals: (DecisionInput & { evidence?: string })[],
+    from: { source: string; source_ref?: string; project?: string },
+  ): Promise<{ decision: Decision; warnings: string[] }[]> {
+    const out: { decision: Decision; warnings: string[] }[] = [];
+    for (const { evidence, ...p } of proposals) {
+      // The quote that shows it was settled; where it came from is kept in source/source_ref.
+      const body = evidence ? `> ${evidence.replace(/\n/g, "\n> ")}` : "";
+      try {
+        out.push(
+          await this.createDecision(actor, {
+            ...p,
+            status: "proposed",
+            projects: from.project ? [from.project] : [],
+            body,
+            source: `capture:${from.source}`,
+            source_ref: from.source_ref,
+          }),
+        );
+      } catch (e) {
+        // One bad proposal (say, a key that vanished meanwhile) must not lose the rest.
+        if (!(e instanceof ValidationError || e instanceof ConflictError)) throw e;
+      }
+    }
+    return out;
   }
 
   /** Edit a decision. Every change bumps the revision and is kept in history. */
@@ -326,9 +372,13 @@ export class Repo {
         set("depends_on", json(deps));
       }
       if (!sets.length) return cur;
+      const accepting = next.status === "accepted" && cur.status !== "accepted";
+      const pending = accepting ? cur.supersedes.filter((k) => all.find((d) => d.id === k)?.status !== "superseded" || all.find((d) => d.id === k)?.superseded_by !== key) : [];
+      if (accepting) this.assertSupersedable(new Map(all.map((d) => [d.id, d])), pending);
       await tx.query(`UPDATE decisions SET ${sets.join(", ")}, revision = revision + 1, updated_at = now() WHERE workspace_id = $1 AND key = $2`, params);
       const decision = await this.writeRevision(tx, ws.id, key, actor.id, patch.note);
       await this.emit(tx, ws.id, "decision.updated", key, actor.id, { fields: Object.keys(patch).filter((k) => k !== "note"), note: patch.note });
+      await this.applySupersession(tx, ws.id, key, pending, actor.id);
       return decision;
     });
   }
