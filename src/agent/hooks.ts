@@ -158,6 +158,10 @@ function removeHook(settings: any, event: string) {
   if (!settings.hooks[event].length) delete settings.hooks[event];
 }
 
+export const PLUGIN_MARKETPLACE = "decisionengine";
+export const PLUGIN_REPO = "sighup/decisionengine";
+export const PLUGIN_ID = `decisionengine@${PLUGIN_MARKETPLACE}`;
+
 export function installClaudeCode(root: string, bin = "de", opts: { capture?: boolean } = {}): string[] {
   const capture = opts.capture ?? true;
   const done: string[] = [];
@@ -173,8 +177,18 @@ export function installClaudeCode(root: string, bin = "de", opts: { capture?: bo
     removeHook(settings, "Stop");
     removeHook(settings, "SessionEnd");
   }
+  if (capture) {
+    // The plugin captures with each developer's own Claude session (no API key). Declared here so
+    // every teammate who trusts the repository is offered it; the hooks above are the fallback.
+    settings.extraKnownMarketplaces ??= {};
+    settings.extraKnownMarketplaces[PLUGIN_MARKETPLACE] ??= { source: { source: "github", repo: PLUGIN_REPO } };
+    settings.enabledPlugins ??= {};
+    settings.enabledPlugins[PLUGIN_ID] ??= true;
+  } else if (settings.enabledPlugins?.[PLUGIN_ID] !== undefined) {
+    settings.enabledPlugins[PLUGIN_ID] = false;
+  }
   writeJson(settingsPath, settings);
-  done.push(`${relative(root, settingsPath)}: PreToolUse enforcement + SessionStart context${capture ? " + Stop/SessionEnd decision capture" : ""} hooks`);
+  done.push(`${relative(root, settingsPath)}: PreToolUse enforcement + SessionStart context${capture ? " + decision capture (plugin, with Stop/SessionEnd hooks as fallback)" : ""}`);
 
   const mcpPath = join(root, ".mcp.json");
   const mcp = readJson(mcpPath);

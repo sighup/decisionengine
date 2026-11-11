@@ -1,0 +1,11 @@
+{
+  "name": "decisionengine",
+  "owner": { "name": "DecisionEngine" },
+  "plugins": [
+    {
+      "name": "decisionengine",
+      "source": "./plugins/claude-code",
+      "description": "Captures the decisions you settle with Claude as proposals for your team's DecisionEngine, using your own Claude sign-in."
+    }
+  ]
+}

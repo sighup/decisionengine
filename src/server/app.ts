@@ -6,6 +6,7 @@ import { ValidationError } from "../core/validate.js";
 import { PAGE } from "../ui/page.js";
 import { VERSION } from "../version.js";
 import { CAPTURE_SOURCES, MAX_CAPTURE_CHARS } from "../core/capture.js";
+import { fromLooseOutput, type Proposal } from "../core/extraction.js";
 import type { Extractor } from "./extract.js";
 import type { Hub } from "./hub.js";
 import { ConflictError, ForbiddenError, NotFoundError, type Member, type Repo, type Workspace } from "./repo.js";
@@ -83,23 +84,32 @@ export function createApp(repo: Repo, hub: Hub, opts: { heartbeatMs?: number; ex
   app.patch("/v1/decisions/:key", async (c) => c.json({ decision: await repo.updateDecision(c.get("member"), c.req.param("key"), await c.req.json()) }));
   app.get("/v1/decisions/:key/revisions", async (c) => c.json({ revisions: await repo.revisions(c.get("workspace").id, c.req.param("key")) }));
 
-  // Capture: turn a session transcript, commit history or notes into *proposed* decisions.
-  app.get("/v1/capture", (c) => c.json({ enabled: !!opts.extractor, max_chars: MAX_CAPTURE_CHARS }));
+  // Capture: turn material into *proposed* decisions. Either the client already
+  // ran the extraction on its own Claude and sends the model's output, or it
+  // sends the material and the service's extractor (if configured) reads it.
+  app.get("/v1/capture", (c) => c.json({ enabled: true, server_extraction: !!opts.extractor, max_chars: MAX_CAPTURE_CHARS }));
   app.post("/v1/capture", async (c) => {
-    if (!opts.extractor) return c.json({ error: "capture is not enabled on this server (set ANTHROPIC_API_KEY)" }, 501);
     const b = await c.req.json();
     if (!CAPTURE_SOURCES.includes(b?.source)) throw new ValidationError(`source must be one of ${CAPTURE_SOURCES.join(", ")}`);
-    if (typeof b.text !== "string" || !b.text.trim()) throw new ValidationError("text is required");
-    if (b.text.length > MAX_CAPTURE_CHARS) return c.json({ error: `text exceeds ${MAX_CAPTURE_CHARS} characters; split it` }, 413);
     const ws = c.get("workspace").id;
-    const { decisions: existing } = await repo.listDecisions(ws);
-    const proposals = await opts.extractor.extract({ source: b.source, text: b.text, existing });
-    const created = await repo.createProposals(c.get("member"), proposals, {
+    const from = {
       source: b.source,
       source_ref: typeof b.source_ref === "string" ? b.source_ref : undefined,
       project: typeof b.project === "string" && b.project ? b.project : undefined,
-    });
-    return c.json({ proposals: created }, 201);
+    };
+    let proposals: Proposal[];
+    if (b.output !== undefined) {
+      if (JSON.stringify(b.output).length > MAX_CAPTURE_CHARS) return c.json({ error: "output is too large" }, 413);
+      const { decisions: existing } = await repo.listDecisions(ws);
+      proposals = fromLooseOutput(b.output, existing);
+    } else {
+      if (typeof b.text !== "string" || !b.text.trim()) throw new ValidationError("send output (already extracted) or text (to extract here)");
+      if (!opts.extractor) return c.json({ error: "this server does not extract; extract with your own Claude and send output" }, 501);
+      if (b.text.length > MAX_CAPTURE_CHARS) return c.json({ error: `text exceeds ${MAX_CAPTURE_CHARS} characters; split it` }, 413);
+      const { decisions: existing } = await repo.listDecisions(ws);
+      proposals = await opts.extractor.extract({ source: b.source, text: b.text, existing });
+    }
+    return c.json({ proposals: await repo.createProposals(c.get("member"), proposals, from) }, 201);
   });
 
   app.get("/v1/lint", async (c) => {

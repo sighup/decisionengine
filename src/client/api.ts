@@ -90,10 +90,11 @@ export class ApiClient {
     return this.request<{ markdown: string }>("GET", `/v1/digest?days=${days}&format=json`);
   }
   captureStatus() {
-    return this.request<{ enabled: boolean; max_chars: number }>("GET", "/v1/capture");
+    return this.request<{ enabled: boolean; server_extraction: boolean; max_chars: number }>("GET", "/v1/capture");
   }
   /** Extraction can take a while (it reads the whole material), hence the long timeout. */
-  capture(b: { source: CaptureSource; text: string; source_ref?: string; project?: string }, timeoutMs = 10 * 60_000) {
+  /** Send `text` for the service to extract from, or `output` already extracted by the caller's own Claude. */
+  capture(b: { source: CaptureSource; text?: string; output?: unknown; source_ref?: string; project?: string }, timeoutMs = 10 * 60_000) {
     return this.request<{ proposals: { decision: Decision; warnings: string[] }[] }>("POST", "/v1/capture", b, timeoutMs);
   }
   reportChecks(checks: CheckEvent[], timeoutMs?: number) {

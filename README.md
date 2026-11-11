@@ -65,7 +65,7 @@ de invite --name "Dana" --email dana@example.com
 | Every `Write` / `Edit` / `MultiEdit` | A `PreToolUse` hook checks only the lines being added. A violation blocks the edit and tells the agent why. |
 | Every `npm i` / `pip install` / `cargo add` / `go get` | The same hook catches forbidden dependencies before they are installed. |
 | The user settles a choice | The agent records it with `record_decision`, including rejected options. Every teammate's agent has it within seconds. |
-| The agent replies or the session ends | `Stop` and `SessionEnd` hooks send the new part of the conversation for capture, in the background. Anything settled but not recorded becomes a proposal to review. |
+| Every few turns | The plugin asks a fork of the session what was settled. Anything not yet recorded becomes a proposal, shown above the prompt to accept or reject. (Without the plugin, `Stop`/`SessionEnd` hooks do the same with `claude -p`.) |
 | A teammate decides something | The MCP server's live feed updates the local snapshot, so the next hook already enforces it. |
 | Commit / pull request | `de check --staged` (pre-commit) and `de check --base origin/main` (CI) are the final gate. |
 
@@ -83,15 +83,29 @@ Any MCP client (Cursor, Windsurf, Codex, Claude Desktop) can use `de mcp` over s
 
 ## Automatic capture
 
-Most decisions are settled in conversation and never written down. DecisionEngine finds them for you:
+Most decisions are settled in conversation and never written down. DecisionEngine finds them for you, using the Claude you already have: **no API key is needed anywhere.**
 
-- **From agent sessions.** With `de init --claude`, Claude Code sessions are sent to the service in the background as they go (after every few turns, and at the end). Claude reads the conversation and pulls out the choices that were actually settled, with the reasoning and the options turned down.
+- **In Claude Code.** The DecisionEngine plugin asks a fork of your own session, every few turns, which choices were actually settled, with the reasoning and the options turned down. The conversation is already in the prompt cache, so this mostly reads cached tokens, and it runs in the background. Proposals appear above the prompt with **Accept** and **Reject**; `/capture-decisions` asks right away.
 - **From history.** `de capture --from-git` reads the repository's commit history to reconstruct decisions made before you started; `--since`, `--limit` and `--range` narrow it.
 - **From notes.** `de capture --notes meeting.md` (or `-` for stdin) does the same for meeting notes, Slack exports, RFCs and design docs.
 
-Every captured decision arrives as **proposed**, linked to where it came from with a quote as evidence. Nothing is enforced and nothing is superseded until someone accepts it in the dashboard's review inbox (or with `de accept`). Duplicates of existing decisions, and proposals someone already rejected, are skipped.
+Install the plugin in Claude Code (`de init --claude` also declares it in the repository's `.claude/settings.json`, so teammates are offered it when they open the project):
 
-Capture runs on the service and needs `ANTHROPIC_API_KEY` set there (`DE_CAPTURE_MODEL` and `DE_CAPTURE_EFFORT` tune it; `DE_CAPTURE=off` disables it). Only what the developer and agent said is sent, not tool output or file contents, and common credential formats are redacted on the developer's machine first. To turn session capture off for a repository, run `de install claude-code --no-capture`; for one developer, set `DE_CAPTURE=off`. Enforcement never uses the model.
+```
+/plugin install decisionengine --marketplace sighup/decisionengine
+```
+
+Every captured decision arrives as **proposed**, linked to where it came from with a quote as evidence. Nothing is enforced and nothing is superseded until someone accepts it, in the session, in the dashboard's review inbox or with `de accept`. Duplicates of existing decisions, and proposals someone already rejected, are skipped. The service validates everything a client extracts before recording it.
+
+Who runs the model:
+
+| Where | Model | Billed to |
+|---|---|---|
+| Claude Code with the plugin | a fork of the developer's session | the developer's Claude sign-in |
+| Claude Code without the plugin, `de capture` | `claude -p` on the developer's machine (no tools, outside the repo) | the developer's Claude sign-in |
+| Any of the above, if the service has `ANTHROPIC_API_KEY` | the service's extractor (except the plugin, which always forks) | the service's key |
+
+Only what the developer and agent said is read, never tool output or file contents, and common credential formats are redacted before anything leaves the machine. To turn capture off for a repository, run `de install claude-code --no-capture`; for one developer, set `DE_CAPTURE=off`. Enforcement never uses a model.
 
 ### Speed and failure modes
 
@@ -130,7 +144,7 @@ de lint                               broken links, cycles, stale dependencies, 
 de digest [--days 7]                  decided, reversed, enforced: the standup you can skip
 de watch                              follow the team's decisions live
 de ui                                 open the dashboard, signed in
-de capture --from-git | --notes <file>   find decisions in history or notes, as proposals
+de capture --from-git | --notes <file> [--local]   find decisions in history or notes, as proposals
 de import-adr <dir>                   import existing ADRs (Nygard or MADR)
 de export [--format markdown|json]    everything, any time
 de mcp  ·  de hook <event>            agent entry points
@@ -150,7 +164,7 @@ The service is one Node process plus Postgres.
 docker compose up -d     # service on :4477 with Postgres 16
 ```
 
-Set `ANTHROPIC_API_KEY` on the service to turn on automatic capture. Or run `de server` anywhere with `DATABASE_URL` set (Postgres 14+). Migrations run automatically on start. Multiple instances can run behind a load balancer: real-time fan-out goes through Postgres `LISTEN/NOTIFY`. Put TLS in front of it (any reverse proxy). Without `DATABASE_URL`, `de server` uses embedded Postgres in `~/.local/share/decisionengine`, which suits a single machine or a trial.
+Capture needs nothing on the service: developers' own Claude does the reading. Optionally set `ANTHROPIC_API_KEY` there to have the service extract for clients without Claude Code. Or run `de server` anywhere with `DATABASE_URL` set (Postgres 14+). Migrations run automatically on start. Multiple instances can run behind a load balancer: real-time fan-out goes through Postgres `LISTEN/NOTIFY`. Put TLS in front of it (any reverse proxy). Without `DATABASE_URL`, `de server` uses embedded Postgres in `~/.local/share/decisionengine`, which suits a single machine or a trial.
 
 ## CI
 

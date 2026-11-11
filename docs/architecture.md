@@ -27,7 +27,9 @@ DecisionEngine has three parts: a **service** that is the source of truth, **cli
 
 **Fail open.** If the service is unreachable, hooks enforce the last snapshot and queue telemetry for later. If DecisionEngine itself errors, the agent is never blocked. Only a real violation blocks. CI (`de check`) is the exception: it requires a fresh copy from the service, because it is the final gate.
 
-**An LLM captures; people decide; rules enforce.** Most decisions are settled in conversation, so asking people to also write them down loses most of them. Capture reads agent sessions, commit history and notes, and Claude extracts what was actually settled (choice, reasoning, rejected options, a narrow rule when one is obvious). Everything it finds is recorded as `proposed`: never enforced, never superseding anything, until a person accepts it. This keeps the model's judgement out of enforcement entirely. Extraction runs on the service, so API keys live in one place and the model always sees the team's current decisions (to skip duplicates, link dependencies and propose supersessions). Rejected: extracting on each developer's machine (keys everywhere, inconsistent prompts) and auto-accepting high-confidence proposals (one bad rule would block every agent on the team).
+**An LLM captures; people decide; rules enforce.** Most decisions are settled in conversation, so asking people to also write them down loses most of them. Capture reads agent sessions, commit history and notes, and Claude extracts what was actually settled (choice, reasoning, rejected options, a narrow rule when one is obvious). Everything it finds is recorded as `proposed`: never enforced, never superseding anything, until a person accepts it. This keeps the model's judgement out of enforcement entirely. Rejected: auto-accepting high-confidence proposals (one bad rule would block every agent on the team).
+
+**Extraction runs on the developer's own Claude.** Everyone using DecisionEngine already has Claude Code signed in, so the default needs no API key anywhere: in a session, the plugin forks the conversation (`$.model.fork`), which the prompt cache already holds, so extraction mostly reads cached tokens and sees exactly what the developer saw; elsewhere, `claude -p` reads the material. One contract (`src/core/extraction.ts`: instructions, output shape, lenient parsing) is shared by every path, and the service re-validates whatever a client sends against the team's current decisions. A service key remains an option for clients without Claude Code. Rejected: requiring a key on the service (a setup step and a central bill before capture works at all, and the transcript has to be shipped and re-read instead of read from cache).
 
 **Only added lines are checked.** Existing code never blocks new work; a decision governs what happens after it was made.
 
@@ -45,12 +47,17 @@ DecisionEngine has three parts: a **service** that is the source of truth, **cli
 
 ## Capture path
 
-1. Claude Code's `Stop` hook (after each agent reply) and `SessionEnd` hook run `de hook stop|session-end`, which spawns a detached `de capture-session` and returns in milliseconds.
-2. That process reads the session transcript, keeps only what the developer and agent said (no tool output, thinking or injected context), and waits until at least six new turns have built up (any amount at session end). It redacts credentials, prepends a few earlier turns for context, and posts the new part to `POST /v1/capture`. A per-session offset and lock in the cache directory mean each turn is sent once.
-3. The service passes the text and the workspace's current decisions to the extractor (Claude, structured output), validates what comes back, drops duplicates (including proposals someone already rejected) and records each remaining one as a `proposed` decision with `source = capture:<source>`, a `source_ref` back to the session, commits or document, the evidence quote, and the capturing project.
-4. Proposals reach the dashboard's review inbox over the normal change feed. Accepting one makes it enforceable and applies any supersession in the same transaction.
+In Claude Code, with the plugin (`plugins/claude-code/`):
 
-`de capture --from-git` and `de capture --notes` use the same endpoint for commit history (oldest first, in batches, so later batches see earlier proposals) and documents.
+1. On `session.start` the plugin runs `de plugin-capture claim`, which checks the repository is linked and marks the session as the plugin's, so the hook path below stands aside.
+2. After every third completed main-thread turn, outside the turn so nothing waits, it gets the extraction prompt (with the team's current decisions) from `de plugin-capture prompt` and asks a fork of the session.
+3. It hands the reply to `de plugin-capture submit`, which redacts credentials and posts the parsed output to `POST /v1/capture`.
+4. The service validates each decision, drops duplicates (including proposals someone already rejected) and unknown links, and records the rest as `proposed` with `source = capture:claude-code`, a `source_ref` back to the session, the evidence quote and the project.
+5. The plugin shows each proposal above the prompt; Accept and Reject call `de decide-proposal`. Accepting makes it enforceable and applies any supersession in the same transaction. Every client sees it over the normal change feed.
+
+Without the plugin, Claude Code's `Stop` and `SessionEnd` hooks spawn a detached `de capture-session`, which reads the new part of the transcript (only what was said: no tool output, thinking or injected context), waits for six new turns (any at session end), and extracts with `claude -p` (no tools, outside the repository, capture off so it is not itself captured), or with the service's extractor when it has a key. A per-session offset and lock mean each turn is read once.
+
+`de capture --from-git` and `de capture --notes` take the same route for commit history (oldest first, in batches, so later batches see earlier proposals) and documents.
 
 ## Real-time path
 

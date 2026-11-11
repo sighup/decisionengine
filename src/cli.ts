@@ -95,7 +95,7 @@ program
     const { startServer } = await import("./server/main.js");
     const srv = await startServer({ port: Number(o.port), host: o.host, databaseUrl: o.databaseUrl, dataDir: o.dataDir });
     console.log(`DecisionEngine ${VERSION} listening on ${srv.url}  (${o.databaseUrl ? "Postgres" : "embedded Postgres"})`);
-    console.log(srv.capture ? "Automatic capture: on" : c.dim("Automatic capture: off (set ANTHROPIC_API_KEY to turn it on)"));
+    console.log(c.dim(srv.capture ? "Capture: extracts here too (ANTHROPIC_API_KEY is set)" : "Capture: developers' own Claude Code does the extraction (no key needed here)"));
     const health = await new ApiClient(srv.url).health();
     if (health.setup_required) console.log(`\nFirst run. Create your workspace:\n  de setup ${srv.url} --workspace "Acme" --name "Your Name" --email you@example.com`);
     const shutdown = async () => {
@@ -507,15 +507,20 @@ program
   .option("--range <range>", "with --from-git: a revision range, e.g. v1.0..main")
   .option("--notes <file>", "read notes, a thread or a document ('-' for stdin)")
   .option("--ref <ref>", "where the material came from (a URL or name), kept on each proposal")
+  .option("--local", "extract with your own Claude Code even if the server could")
   .option("--yes", "skip the confirmation prompt")
   .action(async (o) => {
     if (!o.fromGit === !o.notes) throw new UsageError("Pass exactly one of --from-git or --notes <file>.");
     const s = session();
-    const status = await s.api.captureStatus();
-    if (!status.enabled) throw new UsageError(`Capture is not enabled on ${s.ctx.server}. The server needs ANTHROPIC_API_KEY set.`);
-    const { readCommits, batchCommits, renderCommits } = await import("./client/capture.js");
-    const { redactSecrets, chunkText } = await import("./core/capture.js");
-    const requests: { text: string; ref?: string; label: string }[] = [];
+    const { readCommits, batchCommits, renderCommits, chooseExtraction, captureMaterial, CaptureUnavailableError, CHUNK_CHARS } = await import("./client/capture.js");
+    let via;
+    try {
+      via = await chooseExtraction(s, o.local ? "claude-code" : undefined);
+    } catch (e) {
+      if (e instanceof CaptureUnavailableError) throw new UsageError(e.message);
+      throw e;
+    }
+    const jobs: { text: string; ref?: string; label: string; what: string }[] = [];
     let source: "git" | "notes";
     if (o.fromGit) {
       source = "git";
@@ -528,31 +533,76 @@ program
         throw new GitError(`git log failed: ${(e as Error).message.split("\n")[0]}`);
       }
       if (!commits.length) return console.log("No commits to read.");
-      // Modest batches keep extraction careful; each sees the proposals from the ones before it.
-      for (const b of batchCommits(commits, 120_000))
-        requests.push({ text: redactSecrets(renderCommits(b)), ref: o.ref ?? `git:${b[0].hash.slice(0, 10)}..${b[b.length - 1].hash.slice(0, 10)}`, label: `${b.length} commits (${b[0].date} to ${b[b.length - 1].date})` });
-      console.log(`Read ${commits.length} commits; ${requests.length} batch(es) to analyse.`);
+      for (const b of batchCommits(commits, CHUNK_CHARS))
+        jobs.push({ text: renderCommits(b), what: "the commit history below", ref: o.ref ?? `git:${b[0].hash.slice(0, 10)}..${b[b.length - 1].hash.slice(0, 10)}`, label: `${b.length} commits (${b[0].date} to ${b[b.length - 1].date})` });
+      console.log(`Read ${commits.length} commits; ${jobs.length} batch(es) to analyse.`);
     } else {
       source = "notes";
       const text = o.notes === "-" ? readStdin() : readFileSync(o.notes, "utf8");
       if (!text.trim()) return console.log("Nothing to read.");
-      const parts = chunkText(redactSecrets(text), 120_000);
-      parts.forEach((t, i) => requests.push({ text: t, ref: o.ref ?? (o.notes === "-" ? undefined : basename(o.notes)), label: parts.length > 1 ? `part ${i + 1}/${parts.length}` : "notes" }));
+      jobs.push({ text, what: "the notes below", ref: o.ref ?? (o.notes === "-" ? undefined : basename(o.notes)), label: o.notes === "-" ? "notes" : basename(o.notes) });
     }
-    const chars = requests.reduce((n, r) => n + r.text.length, 0);
+    const chars = jobs.reduce((n, r) => n + r.text.length, 0);
+    const who = via === "server" ? `${s.ctx.server} for analysis` : "your Claude Code (claude -p) for analysis";
     if (!o.yes && process.stdin.isTTY) {
-      const ok = await prompt(`Send ${chars.toLocaleString()} characters to ${s.ctx.server} for analysis? [y/N] `);
+      const ok = await prompt(`Send ${chars.toLocaleString()} characters to ${who}? [y/N] `);
       if (!/^y/i.test(ok)) return console.log("Cancelled.");
     }
     let total = 0;
-    for (const r of requests) {
-      process.stdout.write(c.dim(`Analysing ${r.label}… `));
-      const res = await s.api.capture({ source, text: r.text, source_ref: r.ref, project: s.ctx.project });
-      console.log(c.dim(`${res.proposals.length} proposal(s)`));
-      for (const { decision: d } of res.proposals) console.log(`  ${c.yellow(d.id)} ${d.title}`);
-      total += res.proposals.length;
+    for (const j of jobs) {
+      process.stdout.write(c.dim(`Analysing ${j.label}… `));
+      const found = await captureMaterial(s, { source, text: j.text, ref: j.ref, what: j.what, via });
+      console.log(c.dim(`${found.length} proposal(s)`));
+      for (const d of found) console.log(`  ${c.yellow(d.id)} ${d.title}`);
+      total += found.length;
     }
     console.log(total ? `\n${total} proposal(s) recorded. Review them in the dashboard (\`de ui\`) or with \`de list --status proposed\`, then \`de accept <id>\`.` : "\nNo settled decisions found.");
+  });
+
+program
+  .command("plugin-capture", { hidden: true })
+  .description("used by the Claude Code plugin: claim | prompt | submit (reply on stdin)")
+  .addArgument(new Command().createArgument("<action>").choices(["claim", "prompt", "submit"]))
+  .requiredOption("--session <id>")
+  .action(async (action, o) => {
+    // Speaks JSON on stdout; never throws at the plugin.
+    const out = (v: unknown) => void process.stdout.write(JSON.stringify(v) + "\n");
+    try {
+      const s = Session.tryOpen();
+      if (!s?.ctx.linked || process.env.DE_CAPTURE === "off") return out({ linked: false });
+      const { claimSessionForPlugin } = await import("./client/capture.js");
+      if (action === "claim") {
+        claimSessionForPlugin(o.session);
+        return out({ linked: true, project: s.ctx.project, server: s.ctx.server });
+      }
+      if (action === "prompt") {
+        const { decisions } = await s.cache.get();
+        const { extractionPrompt } = await import("./core/extraction.js");
+        return out({ linked: true, prompt: extractionPrompt(s.forProject(decisions), "this conversation between the developer and you, their coding agent (everything above this message)") });
+      }
+      const { parseJsonReply } = await import("./core/extraction.js");
+      const { redactSecrets } = await import("./core/capture.js");
+      const output = JSON.parse(redactSecrets(JSON.stringify(parseJsonReply(readStdin()))));
+      const res = await s.api.capture({ source: "claude-code", output, source_ref: `claude-code:${o.session}`, project: s.ctx.project });
+      out({ linked: true, server: s.ctx.server, proposals: res.proposals.map(({ decision: d }) => ({ id: d.id, title: d.title, why: d.why, rules: d.rules.length, supersedes: d.supersedes })) });
+    } catch (e) {
+      out({ error: (e as Error).message });
+    }
+  });
+
+program
+  .command("decide-proposal", { hidden: true })
+  .description("used by the Claude Code plugin: accept or reject a proposal")
+  .addArgument(new Command().createArgument("<verdict>").choices(["accept", "reject"]))
+  .argument("<id>")
+  .action(async (verdict, id) => {
+    const out = (v: unknown) => void process.stdout.write(JSON.stringify(v) + "\n");
+    try {
+      const { decision } = await session().api.update(id, { status: verdict === "accept" ? "accepted" : "deprecated", note: "from Claude Code" });
+      out({ id: decision.id, status: decision.status });
+    } catch (e) {
+      out({ error: (e as Error).message });
+    }
   });
 
 program

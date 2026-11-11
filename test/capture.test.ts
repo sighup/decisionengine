@@ -1,11 +1,35 @@
-import { writeFileSync } from "node:fs";
+import { execFile } from "node:child_process";
+import { chmodSync, readFileSync, writeFileSync } from "node:fs";
+import { promisify } from "node:util";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { batchCommits, captureSession, parseTranscript, readCommits, renderCommits } from "../src/client/capture.js";
+import { batchCommits, captureMaterial, captureSession, chooseExtraction, parseTranscript, readCommits, renderCommits } from "../src/client/capture.js";
+import { extractionPrompt, fromLooseOutput, parseJsonReply } from "../src/core/extraction.js";
 import { chunkText, MAX_CAPTURE_CHARS, redactSecrets } from "../src/core/capture.js";
 import type { ExtractInput, Extractor, Proposal } from "../src/server/extract.js";
-import { toProposals } from "../src/server/extract.js";
+import { toProposals } from "../src/core/extraction.js";
 import { decision, linkedRepo, sh, startTestServer, tmp } from "./helpers.js";
+
+// Never reach for a real `claude` during tests unless a test points DE_CLAUDE_BIN at a stand-in.
+process.env.DE_CAPTURE_LOCAL = "off";
+
+/** A stand-in `claude` CLI: records its arguments and stdin, replies with $FAKE_REPLY. */
+function fakeClaude(reply: object) {
+  const dir = tmp("de-fake-claude-");
+  const bin = join(dir, "claude");
+  writeFileSync(
+    bin,
+    `#!/usr/bin/env node
+const fs = require("fs");
+if (process.argv[2] === "--version") { console.log("2.0.0 (Claude Code)"); process.exit(0); }
+const input = fs.readFileSync(0, "utf8");
+fs.writeFileSync(${JSON.stringify(join(dir, "call.json"))}, JSON.stringify({ args: process.argv.slice(2), input, cwd: process.cwd(), capture: process.env.DE_CAPTURE }));
+console.log(${JSON.stringify("Here you go:\n```json\n" + JSON.stringify(reply) + "\n```")});
+`,
+  );
+  chmodSync(bin, 0o755);
+  return { bin, call: () => JSON.parse(readFileSync(join(dir, "call.json"), "utf8")) };
+}
 
 /** Stands in for Claude: returns whatever the test queued, and records what it was shown. */
 class FakeExtractor implements Extractor {
@@ -79,11 +103,17 @@ describe("capture service", () => {
   });
   afterAll(() => srv.close());
 
-  it("is off without an extractor", async () => {
+  it("without its own key, the service takes output extracted by the client's Claude", async () => {
     const plain = await startTestServer();
     try {
-      expect(await plain.api.captureStatus()).toEqual({ enabled: false, max_chars: MAX_CAPTURE_CHARS });
+      expect(await plain.api.captureStatus()).toEqual({ enabled: true, server_extraction: false, max_chars: MAX_CAPTURE_CHARS });
       await expect(plain.api.capture({ source: "notes", text: "x" })).rejects.toMatchObject({ status: 501 });
+      const old = (await plain.api.create({ title: "Use Yarn" })).decision;
+      const res = await plain.api.capture({
+        source: "notes",
+        output: { decisions: [{ title: "Use pnpm", why: "faster", supersedes: [old.id, "DEC-404"], rules: [{ type: "forbid_dependency", packages: ["yarn"] }] }, { title: "use yarn" }, { why: "no title" }, "junk"] },
+      });
+      expect(res.proposals.map((p) => p.decision)).toEqual([expect.objectContaining({ title: "Use pnpm", status: "proposed", supersedes: [old.id], source: "capture:notes" })]);
     } finally {
       await plain.close();
     }
@@ -92,6 +122,7 @@ describe("capture service", () => {
   it("validates requests", async () => {
     await expect(srv.api.capture({ source: "slack" as any, text: "x" })).rejects.toMatchObject({ status: 400 });
     await expect(srv.api.capture({ source: "notes", text: " " })).rejects.toMatchObject({ status: 400 });
+    await expect(srv.api.capture({ source: "notes", output: { decisions: [{ title: "x".repeat(MAX_CAPTURE_CHARS) }] } })).rejects.toMatchObject({ status: 413 });
     await expect(srv.api.capture({ source: "notes", text: "x".repeat(MAX_CAPTURE_CHARS + 1) })).rejects.toMatchObject({ status: 413 });
   });
 
@@ -237,4 +268,81 @@ describe("Claude extractor", () => {
     await expect(new ClaudeExtractor({ client: reply("max_tokens", null) as any }).extract({ source: "notes", text: "x", existing: [] })).rejects.toThrow(/cut off/);
     await expect(ex.extract({ source: "notes", text: "x".repeat(MAX_CAPTURE_CHARS + 1), existing: [] })).rejects.toThrow(RangeError);
   });
+});
+
+describe("extraction contract", () => {
+  it("asks for bare JSON against the existing decisions, and reads replies leniently", () => {
+    const p = extractionPrompt([decision("DEC-007", { title: "Sessions over JWTs" })], "the notes below");
+    expect(p).toContain("DEC-007 [accepted] Sessions over JWTs");
+    expect(p).toContain("Read the notes below");
+    expect(p).toMatch(/Reply with only a JSON object/);
+    expect(parseJsonReply('Sure.\n```json\n{"decisions": []}\n```')).toEqual({ decisions: [] });
+    expect(() => parseJsonReply("I found nothing.")).toThrow(SyntaxError);
+    expect(fromLooseOutput({ decisions: [{ title: "Use pnpm" }] }, [])).toEqual([
+      expect.objectContaining({ title: "Use pnpm", discipline: "engineering", rules: [], depends_on: [] }),
+    ]);
+    expect(fromLooseOutput({ nope: true }, [])).toEqual([]);
+  });
+});
+
+describe("capture on the developer's own Claude", () => {
+  let srv: Awaited<ReturnType<typeof startTestServer>>;
+  beforeAll(async () => {
+    srv = await startTestServer(); // no server-side key
+    await srv.api.upsertProject({ slug: "web" });
+  });
+  afterAll(() => {
+    process.env.DE_CAPTURE_LOCAL = "off";
+    delete process.env.DE_CLAUDE_BIN;
+    return srv.close();
+  });
+
+  it("runs claude -p with no tools, outside the repo, with capture off, and records what it finds", async () => {
+    const { root, session } = linkedRepo(srv.url, srv.token);
+    await srv.api.create({ title: "Postgres for everything" });
+    const fake = fakeClaude({ decisions: [{ title: "Sessions over JWTs", why: "instant revocation", evidence: "Yes, sessions." }] });
+    process.env.DE_CLAUDE_BIN = fake.bin;
+    delete process.env.DE_CAPTURE_LOCAL;
+
+    expect(await chooseExtraction(session)).toBe("claude-code");
+    const found = await captureMaterial(session, { source: "notes", text: "We agreed: sessions. token=supersecretvalue", what: "the notes below", via: "claude-code" });
+    expect(found.map((d) => [d.title, d.status, d.source, d.projects])).toEqual([["Sessions over JWTs", "proposed", "capture:notes", ["web"]]]);
+
+    const call = fake.call();
+    expect(call.args.slice(0, 1)).toEqual(["-p"]);
+    expect(call.args).toEqual(expect.arrayContaining(["--tools", "", "--no-session-persistence"]));
+    expect(call.args[1]).toContain("Postgres for everything");
+    expect(call.input).toContain("We agreed: sessions.");
+    expect(call.input).not.toContain("supersecretvalue");
+    expect(call.capture).toBe("off");
+    expect(call.cwd.startsWith(root)).toBe(false);
+  });
+
+  it("serves the Claude Code plugin: claim, prompt, submit", async () => {
+    const { root, session } = linkedRepo(srv.url, srv.token);
+    const run = (args: string[], input = "") =>
+      new Promise<any>((resolve, reject) => {
+        const child = execFile("npx", ["tsx", join(__dirname, "../src/cli.ts"), ...args], { cwd: root, env: process.env }, (err, stdout) =>
+          err ? reject(err) : resolve(JSON.parse(stdout.trim().split("\n").at(-1)!)),
+        );
+        child.stdin!.end(input);
+      });
+
+    expect(await run(["plugin-capture", "claim", "--session", "p1"])).toMatchObject({ linked: true, project: "web" });
+    const transcript = join(root, "t.jsonl");
+    writeFileSync(transcript, JSON.stringify({ type: "user", message: { role: "user", content: "hi" } }));
+    expect((await captureSession(session, { transcript, sessionId: "p1", final: true })).status).toBe("disabled");
+
+    const { prompt } = await run(["plugin-capture", "prompt", "--session", "p1"]);
+    expect(prompt).toContain("this conversation between the developer and you");
+
+    const reply = 'Found one.\n```json\n{"decisions":[{"title":"Feature flags via config, not code","why":"ops can flip them","rules":[{"type":"forbid_pattern","pattern":"if \\\\(FLAG_","paths":[],"packages":[],"message":"use config"}]}]}\n```';
+    const res = await run(["plugin-capture", "submit", "--session", "p1"], reply);
+    expect(res.proposals).toEqual([expect.objectContaining({ title: "Feature flags via config, not code", rules: 1 })]);
+    const d = (await srv.api.decision(res.proposals[0].id)).decision;
+    expect(d).toMatchObject({ status: "proposed", source: "capture:claude-code", source_ref: "claude-code:p1", projects: ["web"] });
+
+    expect(await run(["decide-proposal", "accept", d.id])).toEqual({ id: d.id, status: "accepted" });
+    expect(await run(["plugin-capture", "submit", "--session", "p1"], "no json here")).toHaveProperty("error");
+  }, 60_000);
 });

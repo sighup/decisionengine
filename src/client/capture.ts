@@ -2,9 +2,10 @@ import { spawn, execFileSync } from "node:child_process";
 import { closeSync, existsSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { join } from "node:path";
-import { chunkText, MAX_CAPTURE_CHARS, redactSecrets } from "../core/capture.js";
+import { chunkText, redactSecrets, type CaptureSource } from "../core/capture.js";
+import { extractionPrompt, parseJsonReply } from "../core/extraction.js";
 import type { Decision } from "../core/types.js";
-import { ApiError } from "./api.js";
+import { askClaudeCode, claudeCodeAvailable } from "./claude-local.js";
 import { cacheDir } from "./config.js";
 import type { Session } from "./session.js";
 
@@ -60,6 +61,55 @@ export function renderMessages(msgs: TranscriptMessage[]): string {
   return msgs.map((m) => `${m.role === "user" ? "Developer" : "Agent"}: ${m.text}`).join("\n\n");
 }
 
+// ------------------------------------------------------------------ who runs the model
+
+export class CaptureUnavailableError extends Error {}
+
+/** Material per extraction request: modest pieces keep the model careful. */
+export const CHUNK_CHARS = 120_000;
+
+export type Extraction = "server" | "claude-code";
+
+/**
+ * Pick who reads the material: the service when it has its own key, else the
+ * developer's own Claude Code (`claude -p`). Without either, capture is off.
+ */
+export async function chooseExtraction(s: Session, prefer?: Extraction): Promise<Extraction> {
+  const status = await s.api.captureStatus();
+  if (prefer === "claude-code" || !status.server_extraction) {
+    if (claudeCodeAvailable()) return "claude-code";
+    if (prefer === "claude-code") throw new CaptureUnavailableError("Claude Code (`claude`) is not installed or not on PATH.");
+    throw new CaptureUnavailableError(`Capture needs Claude Code (\`claude\`) on this machine, or ANTHROPIC_API_KEY on ${s.ctx.server}.`);
+  }
+  return "server";
+}
+
+/**
+ * Turn material into proposals: chunked, redacted, and sent oldest first so
+ * each piece is read against the proposals the pieces before it produced.
+ */
+export async function captureMaterial(
+  s: Session,
+  opts: { source: CaptureSource; text: string; ref?: string; what: string; via: Extraction; onChunk?: (i: number, n: number, found: Decision[]) => void },
+): Promise<Decision[]> {
+  const parts = chunkText(redactSecrets(opts.text), CHUNK_CHARS);
+  const found: Decision[] = [];
+  for (const [i, part] of parts.entries()) {
+    const base = { source: opts.source, source_ref: opts.ref, project: s.ctx.project };
+    let res;
+    if (opts.via === "server") res = await s.api.capture({ ...base, text: part });
+    else {
+      const { decisions } = await s.api.decisions();
+      const reply = await askClaudeCode(extractionPrompt(s.forProject(decisions), opts.what), part);
+      res = await s.api.capture({ ...base, output: parseJsonReply(reply) });
+    }
+    const got = res.proposals.map((p) => p.decision);
+    found.push(...got);
+    opts.onChunk?.(i, parts.length, got);
+  }
+  return found;
+}
+
 // ------------------------------------------------------------------ session capture
 
 /** Send once this many new turns have accumulated (Stop fires after every agent reply). */
@@ -72,6 +122,8 @@ interface CaptureState {
   sent: number;
   at?: string;
   disabled?: boolean;
+  /** Set when the Claude Code plugin captures this session itself, so the hook path stands aside. */
+  plugin?: boolean;
 }
 
 const stateDir = () => join(cacheDir(), "captures");
@@ -124,7 +176,7 @@ export async function captureSession(
 ): Promise<SessionCaptureResult> {
   const r = await withLock(opts.sessionId, async (): Promise<SessionCaptureResult> => {
     const st = readState(opts.sessionId);
-    if (st.disabled) return { status: "disabled" };
+    if (st.disabled || st.plugin) return { status: "disabled" };
     const msgs = parseTranscript(readFileSync(opts.transcript, "utf8"));
     // The transcript can shrink (e.g. a rewind); start over rather than skip.
     const sent = Math.min(st.sent, msgs.length);
@@ -134,24 +186,30 @@ export async function captureSession(
 
     const context = msgs.slice(Math.max(0, sent - CAPTURE_CONTEXT), sent);
     const header = context.length ? `[Earlier in the conversation, already reviewed; for context only]\n${renderMessages(context)}\n\n[New since then]\n` : "";
-    const text = redactSecrets(header + renderMessages(fresh));
-    const proposals: Decision[] = [];
+    let via: Extraction;
     try {
-      for (const part of chunkText(text, MAX_CAPTURE_CHARS)) {
-        const res = await s.api.capture({ source: "claude-code", text: part, source_ref: `claude-code:${opts.sessionId}`, project: s.ctx.project });
-        proposals.push(...res.proposals.map((p) => p.decision));
-      }
+      via = await chooseExtraction(s);
     } catch (e) {
-      if (e instanceof ApiError && e.status === 501) {
-        writeState(opts.sessionId, { ...st, disabled: true });
-        return { status: "disabled" };
-      }
-      throw e;
+      if (!(e instanceof CaptureUnavailableError)) throw e;
+      writeState(opts.sessionId, { ...st, disabled: true });
+      return { status: "disabled" };
     }
+    const proposals = await captureMaterial(s, {
+      source: "claude-code",
+      text: header + renderMessages(fresh),
+      ref: `claude-code:${opts.sessionId}`,
+      what: "the conversation between a developer and their coding agent below (only the part marked new, if marked)",
+      via,
+    });
     writeState(opts.sessionId, { sent: msgs.length, at: new Date().toISOString() });
     return { status: "sent", proposals };
   });
   return r ?? { status: "busy" };
+}
+
+/** Mark a session as captured by the Claude Code plugin; the Stop/SessionEnd hook path then skips it. */
+export function claimSessionForPlugin(sessionId: string) {
+  writeState(sessionId, { ...readState(sessionId), plugin: true });
 }
 
 /**

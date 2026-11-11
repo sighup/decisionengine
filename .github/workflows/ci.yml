@@ -36,3 +36,16 @@ jobs:
         run: npm test
         env:
           TEST_DATABASE_URL: postgres://de:de@localhost:5432/de
+
+  plugin:
+    # The Claude Code plugin: manifest, hooks module and its tests, checked by Claude Code itself.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm install -g @anthropic-ai/claude-code
+      - run: claude plugin validate .
+      - run: claude plugin validate plugins/claude-code
+      - run: claude plugin test plugins/claude-code

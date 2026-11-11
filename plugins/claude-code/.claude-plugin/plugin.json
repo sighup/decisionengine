@@ -1,0 +1,11 @@
+{
+  "name": "decisionengine",
+  "version": "0.2.0",
+  "description": "Captures the decisions you settle with Claude as proposals for your team's DecisionEngine, using your own Claude sign-in; accept or reject them without leaving the session.",
+  "author": {
+    "name": "DecisionEngine"
+  },
+  "repository": "https://github.com/sighup/decisionengine",
+  "license": "MIT",
+  "types": "./types/index.d.ts"
+}
